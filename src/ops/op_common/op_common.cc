@@ -1606,15 +1606,22 @@ HcclResult HcclGetAlgRes(
     HCCL_INFO("[HcclGetAlgRes] executor->CalcRes.");
     AlgResourceRequest resRequest;
     CHK_RET(executor->CalcRes(comm, param, topoInfo, algHierarchyInfo, resRequest));
+    // 本步新建链数: 默认1保守(未回传该值的引擎分支保持改动前的打印与校验行为),
+    // 增量建链稳态路径回传0(AICPU与DPU经CompReqChannelWithExistChannel裁剪后差集为0),
+    // 用于BatchSendRecv稳态(每step下发但无新链)跳过空值摘要与空一致性校验;
+    // AIV/CCU引擎与增量路径的ctx不填充channels, 摘要channel字段以其打印本步真实新建链数
+    u32 newLinkCountThisStep = 1;
     auto ret = GetAlgResWithEngine(
         comm, param, resRequest, resCtxHost, topoInfo, algHierarchyInfo, resCtxSequence, size, increCreateChannelFlag,
-        resPack);
+        resPack, &newLinkCountThisStep);
     if (ret == HCCL_E_UNAVAIL) {
         return HCCL_E_UNAVAIL;
     }
     CHK_RET(ret);
 
-    if (resCtxHost != nullptr) {
+    // BatchSendRecv(OPBASE)增量建链: 稳态无新建链时跳过摘要, 避免每个step下发刷屏;
+    // 全量分配或增长期(有新建链)正常打印
+    if (resCtxHost != nullptr && (param.opType != HcclCMDType::HCCL_CMD_BATCH_SEND_RECV || newLinkCountThisStep > 0)) {
         // 拼接各level的channel数量信息
         std::string channelNumInfo;
         for (size_t i = 0; i < resCtxHost->channels.size(); i++) {
@@ -1622,6 +1629,9 @@ HcclResult HcclGetAlgRes(
                 channelNumInfo += ", ";
             channelNumInfo += "level" + std::to_string(i) + "[" + std::to_string(resCtxHost->channels[i].size()) + "]";
         }
+        // AIV/CCU引擎与增量路径的ctx不填充channels(分别以地址表/局部hostCtxObj与ccuKernels承载),
+        // 此类场景channel字段改打本步真实新建链数, 避免打印空值与实际建链数不符
+        channelNumInfo = channelNumInfo.empty() ? std::to_string(newLinkCountThisStep) : channelNumInfo;
         HCCL_RUN_INFO(
             "[HcclGetAlgRes] engine[%s], algTag[%s], resource allocated: thread num[%zu], "
             "channel num per level[%s], ccu kernel num[%zu], commName[%s], userRank[%u], ctxSize[%llu].",
@@ -1630,8 +1640,9 @@ HcclResult HcclGetAlgRes(
             topoInfo->userRank, size);
     }
 
-    // 参数一致性校验
-    if (needInconsistentCheck) {
+    // 参数一致性校验; BatchSendRecv稳态无新建链时跳过空校验(零channel零比较), 避免每个step下发刷屏;
+    // 增长期有新建链时照常校验新链
+    if (needInconsistentCheck && (param.opType != HcclCMDType::HCCL_CMD_BATCH_SEND_RECV || newLinkCountThisStep > 0)) {
         OpExchangeInfo exchangeInfo{};
         CHK_RET(FillOpExchangeInfo(comm, param, exchangeInfo));
         CHK_RET(CompareOpExchangeInfos(comm, param, resRequest, exchangeInfo));
@@ -1735,11 +1746,21 @@ static HcclResult ReleaseCcuAcquiredChannels(HcclComm comm, AlgResourceRequest& 
 }
 #endif // CANN_VERSION_NUM >= CANN_VERSION(9, 1, 0)
 
+// 统计建链请求总数: AICPU/DPU增量分支返回前已被裁剪为差集, 全量分配为全量请求, 即本步新建链数
+static u32 SumChannelRequestNum(const AlgResourceRequest& resRequest)
+{
+    u32 total = 0;
+    for (const auto& levelChannels : resRequest.channels) {
+        total += static_cast<u32>(levelChannels.size());
+    }
+    return total;
+}
+
 HcclResult GetAlgResWithEngine(
     HcclComm comm, OpParam& param, AlgResourceRequest& resRequest,
     std::unique_ptr<AlgResourceCtxSerializable>& resCtxHost, TopoInfoWithNetLayerDetails* topoInfo,
     AlgHierarchyInfoForAllLevel& algHierarchyInfo, void** resCtxSequence, uint64_t& size, bool increCreateChannelFlag,
-    const ResPackGraphMode& resPack)
+    const ResPackGraphMode& resPack, u32* newLinkCountThisStep)
 {
     // host侧资源
     if (param.engine == COMM_ENGINE_RESERVED) {
@@ -1748,6 +1769,10 @@ HcclResult GetAlgResWithEngine(
         CHK_RET(GetAlgResDPU(
             comm, param, resRequest, resCtxHost, topoInfo, algHierarchyInfo, resCtxSequence, size,
             increCreateChannelFlag, resPack));
+        // DPU委托GetAlgResAICPU, 增量稳态下channels已被CompReqChannelWithExistChannel裁剪为空
+        if (newLinkCountThisStep != nullptr) {
+            *newLinkCountThisStep = SumChannelRequestNum(resRequest);
+        }
     } else if (param.engine == COMM_ENGINE_CPU_TS) {
         // COMM_ENGINE_CPU_TS
     } else if (param.engine == COMM_ENGINE_AICPU) {
@@ -1756,7 +1781,15 @@ HcclResult GetAlgResWithEngine(
         CHK_RET(GetAlgResAICPU(
             comm, param, resRequest, resCtxHost, topoInfo, algHierarchyInfo, resCtxSequence, size,
             increCreateChannelFlag, resPack));
+        // 增量稳态下channels已被CompReqChannelWithExistChannel裁剪为空(全量分配路径channels非空)
+        if (newLinkCountThisStep != nullptr) {
+            *newLinkCountThisStep = SumChannelRequestNum(resRequest);
+        }
     } else if (param.engine == COMM_ENGINE_AIV) {
+        // beta.3基线AIV无增量建链分支, 每次均全量建链, 本步新建链数即全量请求数
+        if (newLinkCountThisStep != nullptr) {
+            *newLinkCountThisStep = SumChannelRequestNum(resRequest);
+        }
         CHK_RET(GetAlgResAiv(comm, param, resRequest, topoInfo, algHierarchyInfo, resCtxSequence, size));
     } else if (param.engine == COMM_ENGINE_CCU) {
         auto ret = GetAlgResCcu(
@@ -1788,6 +1821,10 @@ HcclResult GetAlgResWithEngine(
         }
         CHK_RET(ret);
 #endif
+        // CCU不做增量建链, 资源分配路径存在即视为有新建链(通道资源由ccuKernels承载, 摘要以其为准)
+        if (newLinkCountThisStep != nullptr) {
+            *newLinkCountThisStep = 1;
+        }
     } else {
         HCCL_ERROR(
             "fail to get engine, invalid engine type[%s].",
