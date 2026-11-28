@@ -125,6 +125,17 @@ void UpdateAicpuTimeoutCtx(const OpParam& param, AlgResourceCtxSerializable& res
         timeout.kernelLaunchTimeout, static_cast<u32>(IsHcommDefaultTimeoutSupported()));
 }
 
+static HcclResult checkValidAlgName(const OpParam& param, const std::string& algName)
+{
+    if (algName == "") {
+        HCCL_ERROR(
+            "[Selector] select algname fail, algName is empty, commName[%s], opType[%s].", param.commName,
+            HcclCMDTypeToString(param.opType).c_str());
+        return HCCL_E_PTR;
+    }
+    return HCCL_SUCCESS;
+}
+
 #ifdef HCCL_ALGO_PLUGIN_ENABLE
 namespace {
 
@@ -156,10 +167,7 @@ namespace {
             "[Selector] plugin algorithm selected, algName=[%s], opType=[%s]", algName.c_str(),
             HcclCMDTypeToString(param.opType).c_str());
 
-        if (algName == "") {
-            HCCL_ERROR("[Selector] select algname fail!");
-            return HCCL_E_PTR;
-        }
+        CHK_RET(checkValidAlgName(param, algName));
 
         // 保持原来 Plugin 命中后的公共收尾行为
         CHK_RET(SetOpParamAlgTag(param, algName));
@@ -182,15 +190,6 @@ namespace {
         }                                                                                        \
     } while (0)
 #endif
-
-static HcclResult checkValidAlgName(const std::string& algName)
-{
-    if (algName == "") {
-        HCCL_ERROR("[Selector] select algname fail!");
-        return HCCL_E_PTR;
-    }
-    return HCCL_SUCCESS;
-}
 
 HcclResult
 Selector(HcclComm comm, OpParam& param, std::unique_ptr<TopoInfoWithNetLayerDetails>& topoInfo, std::string& algName)
@@ -234,13 +233,20 @@ Selector(HcclComm comm, OpParam& param, std::unique_ptr<TopoInfoWithNetLayerDeta
         "[Selector] hostDPUOnly=%d, isSupportNda=%d, useNdaSelector=%d.", hostDPUOnly, isSupportNda, useNdaSelector);
 
     // 算法选择，选择完后顺便param.algTag设置了，资源的保存是以算子+算法为单位
+    HcclResult selectRet = HCCL_SUCCESS;
     if (!useNdaSelector && ((topoInfo->level0Topo == Level0Shape::MESH_1D) || AutoSelectorBase::IsDevType960())) {
-        CHK_RET(SelectorEngine::Global()->Run(comm, param, topoInfo.get(), algName));
+        selectRet = SelectorEngine::Global()->Run(comm, param, topoInfo.get(), algName);
     } else {
         std::shared_ptr<ExecuteSelector> collAlgSelector = std::make_shared<ExecuteSelector>(ExecuteSelector());
-        CHK_RET(collAlgSelector->Run(param, topoInfo.get(), algName));
+        selectRet = collAlgSelector->Run(param, topoInfo.get(), algName);
     }
-    CHK_RET(checkValidAlgName(algName));
+    CHK_PRT_RET(
+        selectRet != HCCL_SUCCESS,
+        HCCL_ERROR(
+            "[%s] algorithm selection failed, commName[%s], opType[%s], ret[%d].", __func__, param.commName,
+            HcclCMDTypeToString(param.opType).c_str(), static_cast<int>(selectRet)),
+        selectRet);
+    CHK_RET(checkValidAlgName(param, algName));
     // ccu only 模式命中 CCU 算法后归一化为基模式，后续资源/执行路径仅感知基模式
     if (param.opExecuteConfig == OpExecuteConfig::CCU_MS_ONLY) {
         param.opExecuteConfig = OpExecuteConfig::CCU_MS;
@@ -281,8 +287,16 @@ Selector(HcclComm comm, OpParam& param, std::unique_ptr<TopoInfoWithNetLayerDeta
         errno_t algCopyRet = strncpy_s(algNameBuf, ALG_MAX_LENGTH, algName.c_str(), algName.size());
         CHK_PRT_RET(algCopyRet != EOK, HCCL_ERROR("[%s] strncpy_s for algName failed.", __func__), HCCL_E_MEMORY);
         void* topoInfoVoidPtr = static_cast<void*>(&topoInfo);
-        CHK_RET(
-            CheckCcuParamAndFallbackC(comm, static_cast<void*>(&param), &topoInfoVoidPtr, algNameBuf, ALG_MAX_LENGTH));
+        HcclResult ccuFallbackRet
+            = CheckCcuParamAndFallbackC(comm, static_cast<void*>(&param), &topoInfoVoidPtr, algNameBuf, ALG_MAX_LENGTH);
+        CHK_PRT_RET(
+            ccuFallbackRet != HCCL_SUCCESS,
+            HCCL_ERROR(
+                "[%s] CCU param check and negotiate fallback failed, commName[%s], opType[%s], algName[%s], "
+                "ret[%d].",
+                __func__, param.commName, HcclCMDTypeToString(param.opType).c_str(), algName.c_str(),
+                static_cast<int>(ccuFallbackRet)),
+            ccuFallbackRet);
         algName = algNameBuf;
     }
 #endif
@@ -815,7 +829,11 @@ HcclResult HcclExecOpCcuFastLaunch(HcclComm comm, OpParam& param, const CcuFastL
     HCCL_DEBUG("[HcclExecOpCcuFastLaunch] algName: [%s]", algName.c_str());
     std::unique_ptr<InsCollAlgBase> executor = CollAlgExecRegistryV2::Instance().GetAlgExec(param.opType, algName);
     CHK_PRT_RET(
-        executor.get() == nullptr, HCCL_ERROR("Fail to find executor for algName[%s]", algName.c_str()), HCCL_E_PARA);
+        executor.get() == nullptr,
+        HCCL_ERROR(
+            "Fail to find executor for algName[%s], commName[%s], tag[%s].", algName.c_str(), param.commName,
+            param.tag),
+        HCCL_E_PARA);
 
     void* cclBufferAddr;
     uint64_t cclBufferSize;
@@ -958,14 +976,23 @@ HcclResult ReSelector(
     // 拓扑已有，无需再计算
 
     // 算法选择，选择完后顺便param.algTag设置了，资源的保存是以算子+算法为单位
+    HcclResult selectRet = HCCL_SUCCESS;
     if ((topoInfo->level0Topo == Level0Shape::MESH_1D) || AutoSelectorBase::IsDevType960()) {
-        CHK_RET(SelectorEngine::Global()->Run(comm, param, topoInfo.get(), algName));
+        selectRet = SelectorEngine::Global()->Run(comm, param, topoInfo.get(), algName);
     } else {
         std::shared_ptr<ExecuteSelector> collAlgSelector = std::make_shared<ExecuteSelector>(ExecuteSelector());
-        CHK_RET(collAlgSelector->Run(param, topoInfo.get(), algName));
+        selectRet = collAlgSelector->Run(param, topoInfo.get(), algName);
     }
+    CHK_PRT_RET(
+        selectRet != HCCL_SUCCESS,
+        HCCL_ERROR(
+            "[%s] algorithm selection failed, commName[%s], opType[%s], ret[%d].", __func__, param.commName,
+            HcclCMDTypeToString(param.opType).c_str(), static_cast<int>(selectRet)),
+        selectRet);
     if (algName == "") {
-        HCCL_ERROR("[ReSelector] select algname fail!");
+        HCCL_ERROR(
+            "[%s] select algname fail, algName is empty, commName[%s], opType[%s].", __func__, param.commName,
+            HcclCMDTypeToString(param.opType).c_str());
         return HCCL_E_PTR;
     }
     CHK_RET(SetCommEngine(param));
@@ -1414,7 +1441,9 @@ HcclResult HcclExecOp(
 
     int result = sprintf_s(param.algName, sizeof(param.algName), "%s", algName.c_str());
     if (result <= 0) {
-        HCCL_ERROR("failed to fill param.algName");
+        HCCL_ERROR(
+            "[%s] failed to fill param.algName, commName[%s], tag[%s], algName[%s].", __func__, param.commName,
+            param.tag, algName.c_str());
         return HCCL_E_INTERNAL;
     }
     param.hcclComm = comm;
@@ -1439,13 +1468,17 @@ HcclResult HcclExecOp(
     const char* opModeStr = isOpBase ? "_opbase" : "_offload";
     auto ret = sprintf_s(param.commModeTag, sizeof(param.commModeTag), "%s_%s", param.commName, opModeStr);
     if (ret <= 0) {
-        HCCL_ERROR("[%s] failed to fill param.commModeTag", __func__);
+        HCCL_ERROR("[%s] failed to fill param.commModeTag, commName[%s].", __func__, param.commName);
         return HCCL_E_INTERNAL;
     }
 
     std::unique_ptr<InsCollAlgBase> executor = CollAlgExecRegistryV2::Instance().GetAlgExec(param.opType, algName);
     CHK_PRT_RET(
-        executor.get() == nullptr, HCCL_ERROR("Fail to find executor for algName[%s]", algName.c_str()), HCCL_E_PARA);
+        executor.get() == nullptr,
+        HCCL_ERROR(
+            "Fail to find executor for algName[%s], commName[%s], tag[%s].", algName.c_str(), param.commName,
+            param.tag),
+        HCCL_E_PARA);
 
     // 资源结构体
     std::unique_ptr<AlgResourceCtxSerializable> resCtxHost = std::make_unique<AlgResourceCtxSerializable>();
@@ -1468,10 +1501,15 @@ HcclResult HcclExecOp(
     if (resRet == HCCL_E_UNAVAIL) {
         if (param.commOpExpansionMode == static_cast<HcclOpExpansionMode>(HCCL_OP_EXPANSION_EXT_CCU_MS_ONLY)
             || param.commOpExpansionMode == static_cast<HcclOpExpansionMode>(HCCL_OP_EXPANSION_EXT_CCU_SCHED_ONLY)) {
-            HCCL_ERROR("[HcclGetAlgRes] resource unavailable, ccu only mode does not support fallback.");
+            HCCL_ERROR(
+                "[HcclGetAlgRes] resource unavailable, ccu only mode does not support fallback, commName[%s], tag[%s], "
+                "algName[%s].",
+                param.commName, param.tag, algName.c_str());
             return HCCL_E_NOT_SUPPORT;
         }
-        HCCL_WARNING("[HcclGetAlgRes] resource unavailable, try to fallback.");
+        HCCL_WARNING(
+            "[HcclGetAlgRes] resource unavailable, try to fallback, commName[%s], tag[%s], algName[%s].",
+            param.commName, param.tag, algName.c_str());
         CHK_RET(FallbackOp(comm, param, topoInfo, algName, resPack));
         return HCCL_SUCCESS;
     } else {
@@ -1558,6 +1596,7 @@ HcclResult HcclExecOp(
         if (resCtxHost->slaveThreadNum > 0) {
             CHK_RET(CaptureSlaveStreams(comm, param.stream, resCtxHost->threads, param.isCapture));
         }
+        // CCU引擎Host侧展开
         CHK_RET(executor->Orchestrate(param, *resCtxHost));
     } else {
         if (isResourceReused) {
@@ -1570,6 +1609,7 @@ HcclResult HcclExecOp(
                 HCCL_ERROR("[%s] failed to deserialize reused resCtx, ctxSize[%llu].", __func__, param.ctxSize),
                 HCCL_E_INTERNAL);
         }
+        // HostDPU引擎（CPU_TS）
         CHK_RET(executor->Orchestrate(param, *resCtxHost));
     }
     // op上报
@@ -2038,7 +2078,13 @@ HcclResult HcclGetAlgRes(
     // 资源计算
     HCCL_INFO("[HcclGetAlgRes] executor->CalcRes.");
     AlgResourceRequest resRequest;
-    CHK_RET(executor->CalcRes(comm, param, topoInfo, algHierarchyInfo, resRequest));
+    HcclResult calcRet = executor->CalcRes(comm, param, topoInfo, algHierarchyInfo, resRequest);
+    CHK_PRT_RET(
+        calcRet != HCCL_SUCCESS,
+        HCCL_ERROR(
+            "[%s] resource calculation failed, commName[%s], algTag[%s], algName[%s], ret[%d].", __func__,
+            param.commName, param.algTag, param.algName, static_cast<int>(calcRet)),
+        calcRet);
     // 本步新建链数: 默认1保守(未回传该值的引擎分支保持改动前的打印与校验行为),
     // 增量建链稳态路径回传0(AIV增量剔除后剩余数为0/AICPU与DPU裁剪后差集为0),
     // 用于BatchSendRecv稳态(每step下发但无新链)跳过空值摘要与空一致性校验;
@@ -2050,7 +2096,12 @@ HcclResult HcclGetAlgRes(
     if (ret == HCCL_E_UNAVAIL) {
         return HCCL_E_UNAVAIL;
     }
-    CHK_RET(ret);
+    CHK_PRT_RET(
+        ret != HCCL_SUCCESS,
+        HCCL_ERROR(
+            "[%s] resource allocation failed, commName[%s], algTag[%s], algName[%s], ret[%d].", __func__,
+            param.commName, param.algTag, param.algName, static_cast<int>(ret)),
+        ret);
 
     // BatchSendRecv(OPBASE)增量建链: 稳态无新建链时跳过摘要, 避免每个step下发刷屏;
     // 全量分配或增长期(有新建链)正常打印(AIV全量分配不受channels是否为空影响)
@@ -4796,7 +4847,9 @@ HcclResult SetOpParamAlgTag(OpParam& param, const std::string& algName)
             param.algTag, sizeof(param.algTag), sizeof(param.algTag), "%s_%s_%s", param.tag, temp.c_str(), launchMode);
     }
     if (len < 0 || len >= sizeof(param.algTag)) {
-        HCCL_ERROR("failed to fill param.algTag");
+        HCCL_ERROR(
+            "[%s] failed to fill param.algTag, commName[%s], tag[%s], algName[%s].", __func__, param.commName,
+            param.tag, temp.c_str());
         return HcclResult::HCCL_E_INTERNAL;
     }
 
@@ -4810,7 +4863,10 @@ HcclResult SetOpParamAlgTag(OpParam& param, const std::string& algName)
             int len_ccu = snprintf_s(param.algTag + len, remainBytes, remainBytes, "%s", ccuExtraTag.c_str());
             CHK_PRT_RET(
                 (len_ccu < 0 || len_ccu >= sizeof(param.algTag) - len),
-                HCCL_ERROR("failed to fill alg tag with ccu dataType"), HCCL_E_INTERNAL);
+                HCCL_ERROR(
+                    "[%s] failed to fill alg tag with ccu dataType, commName[%s], tag[%s], algName[%s].", __func__,
+                    param.commName, param.tag, temp.c_str()),
+                HCCL_E_INTERNAL);
         } catch (const std::out_of_range& e) {
             HCCL_ERROR("[SetOpParamAlgTag] dataType or reduceType out of range: %s", e.what());
             return HCCL_E_PARA;
@@ -4825,7 +4881,9 @@ HcclResult HcclGetOpExpansionMode(HcclComm comm, OpParam& param)
     // 第一步：决定使用哪种模式
     HcclResult ret = DecideHcclOpExpansionMode(comm, finalMode);
     if (ret != HCCL_SUCCESS) {
-        HCCL_ERROR("DecideHcclOpExpansionMode failed, ret: %d", ret);
+        HCCL_ERROR(
+            "[%s] DecideHcclOpExpansionMode failed, commName[%s], tag[%s], ret[%d].", __func__, param.commName,
+            param.tag, static_cast<int>(ret));
         return ret;
     }
     param.commOpExpansionMode = finalMode;
@@ -4833,7 +4891,9 @@ HcclResult HcclGetOpExpansionMode(HcclComm comm, OpParam& param)
     // 第二步：应用选择的模式到param
     ret = ApplyOpExpansionMode(param, finalMode);
     if (ret != HCCL_SUCCESS) {
-        HCCL_ERROR("ApplyOpExpansionMode failed, ret: %d", ret);
+        HCCL_ERROR(
+            "[%s] ApplyOpExpansionMode failed, commName[%s], tag[%s], ret[%d].", __func__, param.commName, param.tag,
+            static_cast<int>(ret));
         return ret;
     }
     return HCCL_SUCCESS;

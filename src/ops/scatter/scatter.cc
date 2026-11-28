@@ -98,7 +98,8 @@ HcclResult HcclScatter(
         HCCL_RUN_INFO("%s", logInfo.c_str());
     }
 
-    CHK_RET(ScatterOutPlace(param, sendBuf, recvBuf, recvCount, dataType, root, comm, stream, rankSize));
+    CHK_RET_AND_PRINT_IDE(
+        ScatterOutPlace(param, sendBuf, recvBuf, recvCount, dataType, root, comm, stream, rankSize), param.tag);
 
     CHK_RET(LogHcclExit("HcclScatter", param.tag, startut));
     return HCCL_SUCCESS;

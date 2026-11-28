@@ -65,7 +65,8 @@ HcclResult HcclReduceScatter(
     CHK_RET(ReduceScatterEntryLog(sendBuf, recvBuf, recvCount, dataType, op, stream, param.tag, "HcclReduceScatter"));
 
     // 执行ReduceScatter
-    CHK_RET(ReduceScatterOutPlace(param, sendBuf, recvBuf, recvCount, dataType, op, comm, stream, rankSize));
+    CHK_RET_AND_PRINT_IDE(
+        ReduceScatterOutPlace(param, sendBuf, recvBuf, recvCount, dataType, op, comm, stream, rankSize), param.tag);
 
     CHK_RET(LogHcclExit("HcclReduceScatter", param.tag, startut));
 

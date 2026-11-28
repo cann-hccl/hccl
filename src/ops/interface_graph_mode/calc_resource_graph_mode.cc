@@ -320,7 +320,7 @@ HcclResult HcclSelectAlgGraphMode(
     std::unique_ptr<ops_hccl::TopoInfoWithNetLayerDetails> topoInfo
         = std::make_unique<ops_hccl::TopoInfoWithNetLayerDetails>();
     std::string localAlgName;
-    CHK_RET(ops_hccl::Selector(hcclComm, param, topoInfo, localAlgName));
+    CHK_RET_AND_PRINT_IDE(ops_hccl::Selector(hcclComm, param, topoInfo, localAlgName), param.tag);
 
     *ifAiv = (param.engine == CommEngine::COMM_ENGINE_AIV);
 
@@ -412,13 +412,16 @@ HcclResult RecordAivOpArgsGraphMode(
     std::unique_ptr<ops_hccl::TopoInfoWithNetLayerDetails> topoInfo
         = std::make_unique<ops_hccl::TopoInfoWithNetLayerDetails>();
     std::string algName;
-    CHK_RET(ops_hccl::Selector(comm, param, topoInfo, algName));
+    CHK_RET_AND_PRINT_IDE(ops_hccl::Selector(comm, param, topoInfo, algName), param.tag);
 
     std::unique_ptr<ops_hccl::InsCollAlgBase> executor
         = ops_hccl::CollAlgExecRegistryV2::Instance().GetAlgExec(param.opType, algName);
     CHK_PRT_RET(
         executor.get() == nullptr,
-        HCCL_ERROR("[RecordAivOpArgsGraphMode] Failed to find executor for algName[%s]", algName.c_str()), HCCL_E_PARA);
+        HCCL_ERROR(
+            "[%s] Fail to find executor for algName[%s], commName[%s], tag[%s].", __func__, algName.c_str(),
+            param.commName, param.tag),
+        HCCL_E_PARA);
 
     // 启用Only录制模式（会话态由 guard 析构统一清理，覆盖本函数后续全部早退路径）
     ops_hccl::AivRecordingSessionGuard recordingGuard;
@@ -426,7 +429,11 @@ HcclResult RecordAivOpArgsGraphMode(
 
     int algNameRet = sprintf_s(param.algName, sizeof(param.algName), "%s", algName.c_str());
     CHK_PRT_RET(
-        algNameRet <= 0, HCCL_ERROR("[RecordAivOpArgsGraphMode] failed to fill param.algName"), HCCL_E_INTERNAL);
+        algNameRet <= 0,
+        HCCL_ERROR(
+            "[%s] failed to fill param.algName, commName[%s], tag[%s], algName[%s].", __func__, param.commName,
+            param.tag, algName.c_str()),
+        HCCL_E_INTERNAL);
 
     // host侧资源，HcclGetAlgRes内部完成分级通信域计算、资源计算、资源申请及参数一致性校验
     std::unique_ptr<ops_hccl::AlgResourceCtxSerializable> resCtxHostObj
